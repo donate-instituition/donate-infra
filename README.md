@@ -58,6 +58,26 @@ Inbox UI:
 http://localhost:8025
 ```
 
+### Redis
+
+Redis is used by `donate-server` as the shared cache and coordination layer:
+campaign/feed cache, query caching, rate limiting counters, temporary
+sessions/tokens, verification codes, idempotency keys, and distributed locks.
+
+Connection URL for local services:
+
+```env
+REDIS_URL=redis://:donate@localhost:6379
+```
+
+`--maxmemory-policy allkeys-lru` is set so the container never runs out of
+memory in dev: least-recently-used keys are evicted once `--maxmemory` is hit.
+That's the right tradeoff for cache/session data, but it means any use case
+that must never lose a key before its TTL (e.g. an in-progress distributed
+lock) shares eviction risk with everything else in this instance. That's
+acceptable for local development; revisit if a use case needs stronger
+guarantees in production.
+
 ## donate-workers env
 
 ```env
@@ -79,6 +99,7 @@ SMTP_PASS=
 ```env
 RABBITMQ_URL=amqp://donate:donate@localhost:5672
 RABBITMQ_EXCHANGE=donate.jobs
+REDIS_URL=redis://:donate@localhost:6379
 ```
 
 ## Notes
@@ -166,3 +187,42 @@ EMAIL_DLQ_NAME=email.send.dlq
 - Local development: Docker Compose in this repository.
 - Production with RabbitMQ: Amazon MQ for RabbitMQ.
 - Production fully AWS-native: SQS with DLQ.
+
+## Production Redis: Upstash Redis (Free tier)
+
+Do not use this `docker-compose.yml` Redis container in production either.
+For production, `donate-server` points at a managed
+[Upstash Redis](https://upstash.com/) database instead.
+
+Upstash speaks the standard Redis protocol (in addition to a separate REST
+API meant for edge/serverless callers), so `donate-server` does not need a
+different client or code path for local vs. production. The `redis`
+(node-redis) client connects to either one from the same `REDIS_URL`
+variable — only the URL changes, exactly like the `amqp://` → `amqps://`
+switch for RabbitMQ above:
+
+```env
+# Local (Docker, plaintext)
+REDIS_URL=redis://:donate@localhost:6379
+
+# Production (Upstash, TLS — note the "rediss://" scheme)
+REDIS_URL=rediss://default:<password>@<endpoint>.upstash.io:6379
+```
+
+Recommended setup:
+
+1. Create a Redis database in the Upstash console (regional, in the same AWS
+   region as `donate-server` to keep latency low), on the Free plan.
+2. Copy the "Redis" (`rediss://`) connection string from the database
+   details page — not the REST URL/token pair, which is only needed by the
+   HTTP-based `@upstash/redis` client for edge/serverless runtimes.
+3. Store `REDIS_URL` in AWS Secrets Manager or SSM Parameter Store.
+4. Set `REDIS_URL` on the `donate-server` deployment. No other config or
+   code change is required.
+5. The Free plan caps storage, bandwidth, and command throughput — check the
+   current limits on the Upstash pricing page before relying on it for
+   anything beyond cache/rate-limit/session traffic, and upgrade the plan if
+   the project outgrows it.
+
+Application code does not need to change between environments beyond the
+`REDIS_URL` value.
