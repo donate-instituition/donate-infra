@@ -41,6 +41,39 @@ Connection URL for local services:
 RABBITMQ_URL=amqp://donate:donate@localhost:5672
 ```
 
+#### Job queues
+
+`donate-server` publishes four job types; `donate-workers` consumes all four
+via `WorkerRunnerService` (`donate-workers/src/core/worker-runner.service.ts`)
+— exponential backoff on failure (`QUEUE_RETRY_*`/`EMAIL_RETRY_*` below),
+then a dead-letter queue once `maxAttempts` is exhausted. Which job type a
+given `donate-workers` process handles is selected by `WORKER_NAME` — run
+one process per job type (see the `start:*` npm scripts in
+`donate-workers/package.json`).
+
+| Job | Queue | DLQ | Business logic lives in |
+|---|---|---|---|
+| `email.send` | `email.send` | `email.send.dlq` | `donate-workers` |
+| `stripe.webhook` | `stripe.webhook` | `stripe.webhook.dlq` | `donate-workers` |
+| `receipt.generate` | `receipt.generate` | `receipt.generate.dlq` | `donate-workers` |
+| `notification.push` | `notification.push` | `notification.push.dlq` | `donate-workers` |
+
+The other three used to be self-consumed inside `donate-server` with a raw
+`nack(message, false, true)` on any failure — an unconditional, un-backed-off
+requeue loop with no DLQ. They now go through the same
+backoff-then-DLQ machinery `email.send` already had.
+
+Retry/DLQ queues are declared at runtime by `RabbitMqQueueService`
+(`assertRetryQueue`/`assertWorkQueue`), not by `docker-compose.yml` — nothing
+to configure here beyond making sure `RABBITMQ_RETRY_EXCHANGE`/
+`RABBITMQ_DLX_EXCHANGE` match between `donate-server` and `donate-workers`
+(both default to `donate.retry`/`donate.dlx`).
+
+Because `stripe.webhook` and `receipt.generate` moved their processing to
+`donate-workers`, that repo now needs its own MongoDB connection (same
+database as `donate-server`), plus Stripe/S3/Firebase credentials — see
+`donate-workers env` below.
+
 ### Mailpit
 
 Mailpit is used as the local SMTP server for email workers. It captures emails
@@ -63,6 +96,9 @@ http://localhost:8025
 Redis is used by `donate-server` as the shared cache and coordination layer:
 campaign/feed cache, query caching, rate limiting counters, temporary
 sessions/tokens, verification codes, idempotency keys, and distributed locks.
+`donate-workers` also uses it (`IDEMPOTENCY_PROVIDER=redis`) so a job's
+"already completed" marker survives worker restarts and is shared across
+multiple worker replicas.
 
 Connection URL for local services:
 
@@ -92,7 +128,38 @@ SMTP_PORT=1025
 SMTP_SECURE=false
 SMTP_USER=
 SMTP_PASS=
+
+# Idempotency store (survives restarts, shared across replicas)
+IDEMPOTENCY_PROVIDER=redis
+REDIS_URL=redis://:donate@localhost:6379
+
+# Must point at the SAME database donate-server uses — stripe-webhook and
+# receipt-generate read/write donate-server's own collections directly.
+MONGODB_CLUSTER_URI=mongodb://localhost:27017
+MONGODB_DATABASE=test
+
+# Only used to sign/verify the receipt PDF download token — must match
+# donate-server's JWT_SECRET exactly, but donate-workers has no auth
+# surface of its own.
+JWT_SECRET=change-me
+
+STRIPE_SECRET_KEY=
+FIREBASE_PROJECT_ID=
+FIREBASE_CLIENT_EMAIL=
+FIREBASE_PRIVATE_KEY=
 ```
+
+See `donate-workers/.env.example` for the full list (object storage, the
+donation-receipt email template's branding vars, and the shared
+`QUEUE_RETRY_*` policy applied to `stripe.webhook`/`receipt.generate`/
+`notification.push`).
+
+`OBJECT_STORAGE_DRIVER=local` (the default) writes the generated receipt PDF
+to `<cwd>/storage/<key>` on whichever machine runs `donate-workers` —
+`donate-server`'s download endpoint reads from its own `<cwd>/storage`, so
+local mode only works if both processes share that path (e.g. a bind-mounted
+volume). Use `OBJECT_STORAGE_DRIVER=s3` to sidestep this in anything beyond
+single-machine local dev.
 
 ## donate-server env
 
