@@ -100,7 +100,7 @@ autenticação por JWT na conexão, uma "room" por usuário
 
 Duas fontes documentam o modelo de dados dentro do próprio
 `donate-server` (`entidades.md`, `docs/diagrama-entidade-relacionamento.md`)
-mas estão desatualizadas em relação ao código atual — ver seção 7.
+mas estão desatualizadas em relação ao código atual — ver seção 9.
 
 ## 3. Superfície de API (`donate-server`, prefixo implícito por domínio)
 
@@ -122,14 +122,20 @@ usuário autenticado.
   conta Stripe Connect.
 - **institution-staff-memberships** — vínculo funcionário↔instituição,
   convite, papel (OWNER/staff), listagem de equipe.
-- **campaigns** — CRUD, publicação, upload de imagem, curtir/comentar/
-  compartilhar.
+- **campaigns** — CRUD, publicação, curtir/comentar/compartilhar (upload
+  de capa migrou para o módulo `uploads`).
 - **donations** — criação, histórico do doador e da instituição.
 - **payments** — dois controllers (`payments` e `stripe`): criação/
   confirmação de PaymentIntent, cancelamento de assinatura recorrente,
   config pública da Stripe, **webhook do Stripe** (o único ponto de
   verdade sobre o status real do pagamento).
-- **tax-receipts** — CRUD + download de PDF assinado (token HMAC).
+- **tax-receipts** — CRUD + download de PDF; o binário é lido do S3 com as
+  credenciais do próprio servidor e devolvido via streaming na resposta —
+  não um redirect para uma URL assinada do S3 (ver seção 6).
+- **uploads** — módulo genérico de upload em duas etapas (grava em
+  `temp/`, confirma movendo para a chave final `public/`/`private/`),
+  usado por avatar, logo/capa de instituição, capa de campanha, mídia de
+  post e comprovante de prestação de contas.
 - **conversations** / **messages** — chat.
 - **notifications** — inbox in-app, marcar como lida.
 - **posts** / **post-comments** / **post-reactions** — rede social leve
@@ -193,7 +199,68 @@ desenvolvimento roda local via Docker (`donate-infra`); a configuração já
 está pronta para apontar para Upstash Redis em produção sem mudança de
 código, só de variável de ambiente.
 
-## 6. Funcionalidades do app (visão por área)
+## 6. Armazenamento de objetos (S3)
+
+Bucket `elodoar-storage-dev`, provisionado por Terraform neste repositório
+(`terraform/main.tf`, `terraform/iam.tf`) — um usuário IAM dedicado
+(`elodoar-s3-<ambiente>`) com política de privilégio mínimo, só ações de
+objeto (`GetObject`, `PutObject`, `DeleteObject`) no próprio bucket, sem
+nenhuma permissão de IAM (verificado na prática: as mesmas credenciais não
+conseguem sequer listar as próprias políticas anexadas). Driver
+configurável por variável de ambiente (`OBJECT_STORAGE_DRIVER=s3|local`) —
+`local` grava em disco, usado em desenvolvimento antes do bucket existir e
+ainda disponível como fallback.
+
+**Hierarquia de chaves**, compartilhada entre `donate-server` (upload
+vindo do cliente) e `donate-workers` (recibo fiscal gerado internamente):
+
+```
+public/
+  users/{userId}/avatar/{arquivo}
+  institutions/{institutionId}/logo|cover/{arquivo}
+  institutions/{institutionId}/campaigns/{campaignId}/{arquivo}
+  institutions/{institutionId}/posts/{postId}/{arquivo}
+  users/{userId}/posts/{postId}/{arquivo}
+private/
+  users/{userId}/documents/{arquivo}
+  institutions/{institutionId}/documents|reports/{arquivo}
+  campaigns/{campaignId}/proofs/{arquivo}
+  donations/{donationId}/receipts|attachments/{arquivo}
+temp/{uploadId}/{arquivo}
+```
+
+**Upload em duas etapas** (módulo `uploads` no `donate-server`): o cliente
+sobe o arquivo para `temp/{uploadId}/` sem ainda saber a chave final —
+`POST /uploads`. Só quando a entidade dona existe de fato (campanha
+criada, post salvo) o cliente confirma — `POST /uploads/:id/confirm` — e o
+backend move o objeto (`CopyObjectCommand` + `DeleteObjectCommand`) para a
+chave definitiva, checando permissão por categoria antes (dono do próprio
+recurso para categorias de usuário, staff ativo da instituição para
+categorias de instituição/campanha). Esse desenho substituiu as rotas de
+upload que existiam soltas em `campaigns` e `delivery-proofs` (cada uma
+com sua própria cópia de validação de tipo/tamanho, chave achatada sem
+hierarquia, e sem vínculo automático entre o arquivo e a entidade — o
+cliente tinha que fazer upload, receber a URL de volta e mandar um PATCH
+separado).
+
+**Categorias públicas são servidas por redirect** para uma URL assinada do
+S3 (`GET /uploads/public?key=...`) — aceitável porque são ativos públicos
+de qualquer forma (avatar, logo, capa). **Categorias privadas** exigem
+autenticação e checam o dono a partir do próprio prefixo da chave antes de
+gerar a URL assinada (`GET /uploads/private?key=...`).
+
+**Exceção deliberada — recibo fiscal**: mesmo sendo uma chave `private/`,
+o PDF do recibo não passa pelo redirect acima. A rota
+`GET /tax-receipts/:id/pdf` lê o objeto com as credenciais do próprio
+servidor (`ObjectStorageService.getObjectStream`) e faz `pipe()` direto na
+resposta — o domínio do bucket S3 nunca aparece em nenhum ponto visível ao
+cliente (nem um redirect passageiro), diferente do padrão de redirect
+usado pelas demais categorias. No app, "Ver recibo" foi trocado por um
+resumo em modal (sem nenhuma chamada de rede) e "PDF" passou a baixar o
+arquivo de verdade (`expo-file-system` + `expo-sharing`, abre o menu do
+sistema) em vez de abrir uma URL no navegador do aparelho.
+
+## 7. Funcionalidades do app (visão por área)
 
 Confirmado por auditoria de código em 2026-08-11: **nenhum serviço do app
 usa dados mock/em memória** — todos os 13 serviços em `src/services/`
@@ -215,6 +282,9 @@ que descrevia doações, chat e campanhas como simulados).
 - Preferências de notificação (tela antes decorativa, hoje persistida de
   verdade): 4 categorias independentes — Doações, Campanhas, Conversas,
   Resumo por e-mail — com toggle otimista e reversão em caso de erro.
+- Foto de perfil editável de verdade em dois lugares (aba "Perfil" e
+  "Meus dados" em Configurações) — antes o ícone de lápis não tinha
+  nenhum `onPress`.
 
 ### Navegação por papel
 Doador, funcionário de instituição e administrador da plataforma têm
@@ -231,16 +301,23 @@ compartilhado entre papéis, como em versões anteriores):
 - Status da doação é sempre ditado pelo webhook do Stripe processado no
   backend, nunca otimista no cliente.
 - Recibo fiscal em PDF gerado de forma assíncrona após confirmação do
-  pagamento, com link de download assinado.
+  pagamento. "Ver recibo" abre um resumo em modal dentro do app (sem
+  chamada de rede); "PDF" baixa o arquivo de verdade e abre o menu de
+  compartilhar/salvar do sistema — nunca abre uma URL de S3 no navegador
+  (ver seção 6).
 
 ### Campanhas e instituições
 - Busca/listagem com filtro por categoria, detalhe de campanha (progresso,
   itens necessários, descrição), detalhe de instituição (verificação,
-  campanhas ativas), criação de campanha (fluxo da instituição).
+  campanhas ativas), criação de campanha (fluxo da instituição) — capa
+  enviada pelo fluxo genérico de upload em duas etapas.
 
 ### Rede social
 - Feed de posts, curtir, comentar, compartilhar; seguir
-  usuário/instituição/campanha.
+  usuário/instituição/campanha. Composer do doador ganhou upload de
+  foto/vídeo de verdade e vínculo opcional com uma campanha ("Apoio");
+  o terceiro botão do composer ("Evento") foi removido por não existir
+  domínio de evento no backend.
 
 ### Chat
 - Conversas em tempo real doador↔instituição via WebSocket (Socket.IO),
@@ -257,10 +334,10 @@ compartilhado entre papéis, como em versões anteriores):
   `platform-admin`, consumindo os mesmos endpoints `@Roles(PLATFORM_ADMIN)`
   do backend.
 
-## 7. Trabalho mais recente (sessão atual)
+## 8. Trabalho mais recente (sessão atual)
 
 Nesta rodada de desenvolvimento, além de correções pontuais, foram
-entregues três frentes:
+entregues quatro frentes:
 
 1. **Login com Google** — de ponta a ponta (backend + app), incluindo
    onboarding de dois passos para contas novas e uso da foto do Google
@@ -280,8 +357,19 @@ entregues três frentes:
    workers num único processo (`npm run start`), útil para desenvolvimento
    local sem abrir 5 terminais; em produção cada worker ainda pode ser
    escalado como processo independente via `WORKER_NAME=<nome>`.
+4. **Persistência real no S3** (ver seção 6 para a arquitetura completa) —
+   bucket provisionado por Terraform, módulo `uploads` genérico em duas
+   etapas no `donate-server`, substituindo as rotas de upload ad-hoc que
+   existiam em `campaigns`/`delivery-proofs`; avatar, capa de campanha,
+   comprovante de prestação de contas e mídia de post passaram a
+   persistir de verdade no app. Recibo fiscal migrou de "redirect para URL
+   assinada do S3" para "stream do binário através do próprio servidor",
+   removendo qualquer exposição do domínio do bucket ao cliente — inclusive
+   corrigida em produção uma política IAM que faltava `s3:DeleteObject`
+   (necessária para o passo de "mover" do upload em duas etapas), sem a
+   qual a confirmação de upload falhava com `AccessDenied`.
 
-## 8. Divergências encontradas entre código e documentação antiga
+## 9. Divergências encontradas entre código e documentação antiga
 
 Para não citar informação errada na monografia, seguem as inconsistências
 confirmadas por auditoria direta do código (não da documentação):
