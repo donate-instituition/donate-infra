@@ -1,0 +1,17 @@
+# AWS region where the S3 bucket will be created
+aws_region = "us-east-1"
+
+# Deployment environment (dev, staging, production)
+environment = "dev"
+
+# Prefix for the S3 bucket name. Final name: {prefix}-{environment}
+bucket_name_prefix = "elodoar-storage"
+
+# Enable S3 bucket versioning. Increases storage cost but allows object recovery.
+enable_versioning = false
+
+# Days after creation to transition receipts/ objects to Intelligent-Tiering
+receipts_transition_days = 30
+
+# Days after which incomplete multipart uploads are aborted
+abort_multipart_days = 7
