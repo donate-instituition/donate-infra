@@ -56,11 +56,11 @@ resource "aws_instance" "main" {
     }
   }
 
-  user_data = templatefile("${path.module}/user_data.sh", {
+  user_data_base64 = base64gzip(templatefile("${path.module}/user_data.sh", {
     environment = var.environment
     aws_region  = var.aws_region
     domain_name = var.domain_name
-  })
+  }))
 
   tags = {
     Name        = "elodoar-ec2-${var.environment}"

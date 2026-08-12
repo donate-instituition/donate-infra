@@ -1,5 +1,5 @@
 # Docker Compose Production Stack
-# Deployed on EC2 t3.small — reads variables from .env file at runtime
+# Deployed on EC2 t3.small ------------------ reads variables from .env file at runtime
 # Usage: docker compose -f docker-compose.prod.yml up -d
 
 services:
@@ -42,7 +42,7 @@ services:
       rabbitmq:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:3000/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
