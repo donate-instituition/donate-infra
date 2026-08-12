@@ -12,6 +12,7 @@ locals {
     REDIS_PASSWORD                = var.redis_password
     RABBITMQ_DEFAULT_PASS         = var.rabbitmq_password
     FIREBASE_SERVICE_ACCOUNT_JSON = var.firebase_service_account_json
+    EMAIL_ACCOUNT_ACTIVATION_URL  = "https://${var.domain_name}/activate-account"
   }
 }
 

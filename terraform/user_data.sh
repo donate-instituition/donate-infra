@@ -522,11 +522,27 @@ COMPOSEFILE
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
     }
 
-    reverse_proxy donate-server:3000 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-        transport http {
-            read_timeout 300s
+    # Android App Links verification — lets the app claim
+    # https://{$DOMAIN_NAME}/activate-account instead of the browser.
+    handle /.well-known/assetlinks.json {
+        header Content-Type application/json
+        respond `[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.vortely.elodoar",
+    "sha256_cert_fingerprints": ["A0:5D:0B:F5:68:0D:AF:06:6E:2C:93:92:64:99:99:88:39:AB:72:D7:E8:E8:B3:4B:C1:AC:B9:47:A2:97:A3:E0"]
+  }
+}]` 200
+    }
+
+    handle {
+        reverse_proxy donate-server:3000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            transport http {
+                read_timeout 300s
+            }
         }
     }
 }
