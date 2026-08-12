@@ -1,0 +1,176 @@
+# Docker Compose Production Stack
+# Deployed on EC2 t3.small — reads variables from .env file at runtime
+# Usage: docker compose -f docker-compose.prod.yml up -d
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      donate-server:
+        condition: service_healthy
+    environment:
+      - DOMAIN_NAME=${DOMAIN_NAME}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  donate-server:
+    image: ${SERVER_IMAGE}
+    container_name: donate-server
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  donate-workers-email:
+    image: ${WORKERS_IMAGE}
+    container_name: donate-workers-email
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - WORKER_NAME=email
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f node || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  donate-workers-stripe-webhook:
+    image: ${WORKERS_IMAGE}
+    container_name: donate-workers-stripe-webhook
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - WORKER_NAME=stripe-webhook
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f node || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  donate-workers-receipt-generate:
+    image: ${WORKERS_IMAGE}
+    container_name: donate-workers-receipt-generate
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - WORKER_NAME=receipt-generate
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f node || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  donate-workers-notification-push:
+    image: ${WORKERS_IMAGE}
+    container_name: donate-workers-notification-push
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - WORKER_NAME=notification-push
+    networks:
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f node || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    container_name: rabbitmq
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-elodoar}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:
+  redis-data:
+  rabbitmq-data:

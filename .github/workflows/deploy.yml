@@ -1,0 +1,166 @@
+# ==============================================================================
+# Deploy to EC2 — CI/CD Pipeline
+# Builds, scans, pushes Docker images to ECR, and deploys to EC2 via SSH.
+#
+# Trigger: push to main branch
+# Total pipeline target: < 10 minutes for non-dependency changes
+#
+# Required GitHub Secrets:
+#   - AWS_ACCESS_KEY_ID: IAM user access key with ECR push permissions
+#   - AWS_SECRET_ACCESS_KEY: IAM user secret key
+#   - EC2_SSH_PRIVATE_KEY: PEM private key from terraform output (ssh_private_key)
+#   - EC2_HOST: Elastic IP address from terraform output (ec2_elastic_ip)
+#
+# Dockerfile locations (must exist in each project repo):
+#   - donate-server: uses Dockerfile at the root of the donate-server repository
+#   - donate-workers: uses Dockerfile at the root of the donate-workers repository
+#
+# Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11
+# ==============================================================================
+
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ============================================================================
+  # Job 1: Build Docker images, scan for vulnerabilities, push to ECR
+  # Requirements: 7.1, 7.2, 7.3, 7.4, 7.5
+  # ============================================================================
+  build-and-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      server_image: ${{ steps.image-tags.outputs.server_image }}
+      workers_image: ${{ steps.image-tags.outputs.workers_image }}
+
+    steps:
+      # --- Checkout all project sources ---
+      - name: Checkout donate-infra
+        uses: actions/checkout@v4
+
+      - name: Checkout donate-server
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/donate-server
+          path: donate-server
+          # NOTE: If donate-server is in a separate repo, ensure the GitHub token
+          # has access or use a PAT. If it's in the same org, the default token
+          # with appropriate permissions should work.
+
+      - name: Checkout donate-workers
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/donate-workers
+          path: donate-workers
+
+      # --- Configure AWS credentials ---
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --- Login to ECR ---
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # --- Determine image tags ---
+      - name: Set image tags
+        id: image-tags
+        run: |
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          SERVER_IMAGE="${ECR_REGISTRY}/elodoar/donate-server:${{ github.sha }}"
+          WORKERS_IMAGE="${ECR_REGISTRY}/elodoar/donate-workers:${{ github.sha }}"
+          echo "server_image=${SERVER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "workers_image=${WORKERS_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "ecr_registry=${ECR_REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      # --- Build Docker images ---
+      # Req 7.1: Build Docker images for donate-server and donate-workers on push to main
+      - name: Build donate-server image
+        run: |
+          docker build \
+            -t donate-server:${{ github.sha }} \
+            -t ${{ steps.image-tags.outputs.server_image }} \
+            ./donate-server
+
+      - name: Build donate-workers image
+        run: |
+          docker build \
+            -t donate-workers:${{ github.sha }} \
+            -t ${{ steps.image-tags.outputs.workers_image }} \
+            ./donate-workers
+
+      # --- Trivy vulnerability scanning ---
+      # Req 7.2: Run Trivy container image scanning before pushing to registry
+      # Req 7.3: Fail pipeline on CRITICAL or HIGH severity vulnerabilities
+      - name: Trivy scan — donate-server
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "donate-server:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      - name: Trivy scan — donate-workers
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "donate-workers:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      # --- Push images to ECR ---
+      # Req 7.4: Tag images with git SHA and push to ECR
+      # Req 7.5: Fail pipeline if ECR push fails
+      - name: Push donate-server to ECR
+        run: |
+          docker push ${{ steps.image-tags.outputs.server_image }}
+
+      - name: Push donate-workers to ECR
+        run: |
+          docker push ${{ steps.image-tags.outputs.workers_image }}
+
+  # ============================================================================
+  # Job 2: Deploy to EC2 via SSH
+  # Requirements: 7.6, 7.7, 7.8, 7.9, 7.10, 7.11
+  # ============================================================================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+
+    steps:
+      # --- Deploy via SSH ---
+      # Req 7.6: Connect to EC2 via SSH with 60s timeout
+      # Req 7.7: Execute deployment script (pull, stop, start)
+      # Req 7.8: Verify containers reach running state within 120s (handled by deploy.sh)
+      # Req 7.9: AWS credentials and SSH keys stored as GitHub secrets
+      # Req 7.11: deploy.sh handles rollback automatically on failure
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          timeout: 60s
+          script: |
+            /opt/elodoar/deploy.sh ${{ github.sha }}
+
+      # --- Failure reporting ---
+      # Req 7.11: Report failure status (rollback is handled by deploy.sh internally)
+      - name: Report deployment failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed for commit ${{ github.sha }}. The deploy.sh script on EC2 handles automatic rollback to the previous version."
+          echo "Check EC2 logs at /var/log/user-data.log or CloudWatch for details."
+          exit 1

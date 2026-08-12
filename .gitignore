@@ -7,3 +7,7 @@
 *.tfstate.backup
 *.tfvars
 !*.tfvars.example
+
+# Local notes (deployment guides, personal docs)
+.local-notes/
+
